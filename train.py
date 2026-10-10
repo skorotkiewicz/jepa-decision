@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import random
+import sys
 import uuid
 
 import jax
@@ -78,6 +79,12 @@ def main():
     if output.exists():
         parser.error("output already exists; choose a new directory")
     splits = load_splits({name: getattr(args, name) for name in ("train", "validation", "calibration", "test")})
+    demo = all(
+        Path(getattr(args, name)).resolve() == Path(__file__).resolve().parent / "data" / f"{name}.jsonl"
+        for name in splits
+    )
+    if demo:
+        print("Training bundled synthetic demo data. These metrics do not measure real-world accuracy.", file=sys.stderr)
     random.seed(args.seed)
     model = DecisionJEPA(args.encoder, args.device, seed=args.seed)
     rng = jax.device_put(jax.random.PRNGKey(args.seed), model.device)
@@ -146,7 +153,7 @@ def main():
     baseline_calibration = collect_logits(model, splits["calibration"], args.batch_size, baseline=True)
     baseline_temperature = fit_temperature(baseline_calibration, splits["calibration"])
     baseline_test = collect_logits(model, splits["test"], args.batch_size, baseline=True)
-    model.model_id = f"jepa-decision-{uuid.uuid4().hex[:8]}"
+    model.model_id = f"jepa-decision-{'demo-' if demo else ''}{uuid.uuid4().hex[:8]}"
     results = {
         "validation": report(collect_logits(model, splits["validation"], args.batch_size), splits["validation"]),
         "test_uncalibrated": report(test_logits, splits["test"]),
@@ -154,7 +161,7 @@ def main():
         "pretrained_baseline_test": report(baseline_test, splits["test"], baseline_temperature),
     }
     metadata = {
-        "format": 2, "backend": "jax", "model_id": model.model_id, "encoder": args.encoder,
+        "format": 2, "backend": "jax", "demo": demo, "model_id": model.model_id, "encoder": args.encoder,
         "temperature": model.temperature, "baseline_temperature": baseline_temperature,
         "best_epoch": best_epoch, "seed": args.seed,
         "split_counts": {name: len(examples) for name, examples in splits.items()},

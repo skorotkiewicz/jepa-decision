@@ -2,7 +2,7 @@
 
 A supervised text JEPA adaptation of the API in `example.md`. A fine-tuned context encoder predicts the embedding of the correct decision description. A frozen pretrained teacher encodes candidate descriptions. Training combines candidate cross-entropy, latent alignment, and an ordinal loss for scores.
 
-This is not self-supervised I-JEPA, and switching frameworks does not improve accuracy by itself. No task dataset or trained checkpoint is included. The offline tests verify computation and the API, not semantic accuracy.
+This is not self-supervised I-JEPA, and switching frameworks does not improve accuracy by itself. Bundled synthetic demo data makes the default commands runnable. No production dataset or trained checkpoint is versioned. Demo metrics and offline tests do not establish real-world accuracy.
 
 ## Setup
 
@@ -31,7 +31,7 @@ Provide four nonempty, disjoint files. Repeated states or explicit `group` value
 ./train.sh
 ```
 
-Defaults are `data/train.jsonl`, `data/validation.jsonl`, `data/calibration.jsonl`, `data/test.jsonl`, and output `checkpoints/run-1`. Create the labeled data files first. Pass any `train.py` options to override defaults, for example `./train.sh --epochs 1 --output checkpoints/run-2`. Existing checkpoint directories are not overwritten.
+Defaults use the four bundled synthetic JSONL files in `data/` and create `checkpoints/run-1`. See [the demo data notes](data/README.md). Training with all four default data paths marks the model ID and metadata as a demo. Pass any `train.py` options to override defaults, for example `./train.sh --epochs 1 --output checkpoints/run-2`. Existing checkpoint directories are not overwritten. For real evaluation, pass four independently labeled files at other paths and use a new output directory.
 
 Both scripts run from the repository directory, even when called elsewhere. They use `.venv/bin/python`; set `PYTHON=/path/to/python` to use another installed environment. They do not install dependencies automatically.
 
@@ -47,7 +47,7 @@ CPU is the default. `--device gpu` or `--device gpu:0` requires a compatible acc
 ./run.sh
 ```
 
-The server runs in the foreground at `http://127.0.0.1:8001`, loading `checkpoints/run-1`. Stop it with Ctrl+C. Override the checkpoint and Uvicorn options as needed:
+Run `./train.sh` first, then `./run.sh`. The server runs in the foreground at `http://127.0.0.1:8001`, loading the completed `checkpoints/run-1`. Stop it with Ctrl+C. Override the checkpoint and Uvicorn options as needed:
 
 ```sh
 JEPA_CHECKPOINT=checkpoints/run-2 ./run.sh --port 8002

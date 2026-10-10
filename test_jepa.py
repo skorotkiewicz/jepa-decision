@@ -142,6 +142,17 @@ class JepaTest(unittest.TestCase):
             self.assertEqual(client.post("/v1/decisions", json={**payload, "state": "refund " * 64}).status_code, 422)
             self.assertEqual(client.post("/v1/decisions", json={**payload, "questions": {}}).status_code, 422)
 
+    def test_bundled_demo_splits(self):
+        data = Path(__file__).resolve().parent / "data"
+        splits = load_splits({name: str(data / f"{name}.jsonl") for name in (
+            "train", "validation", "calibration", "test",
+        )})
+        self.assertEqual({name: len(rows) for name, rows in splits.items()}, {
+            "train": 56, "validation": 18, "calibration": 18, "test": 18,
+        })
+        for rows in splits.values():
+            self.assertEqual({row.question.type for row in rows}, {"noul", "choice", "score"})
+
     def test_training_cli_and_split_leakage(self):
         paths = {}
         for split, state in zip(("train", "validation", "calibration", "test"), ("one", "two", "three", "four")):
