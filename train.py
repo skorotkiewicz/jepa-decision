@@ -79,8 +79,8 @@ def main():
         parser.error("output already exists; choose a new directory")
     splits = load_splits({name: getattr(args, name) for name in ("train", "validation", "calibration", "test")})
     random.seed(args.seed)
-    rng = jax.random.PRNGKey(args.seed)
     model = DecisionJEPA(args.encoder, args.device, seed=args.seed)
+    rng = jax.device_put(jax.random.PRNGKey(args.seed), model.device)
     # Check lengths without evaluating test labels or creating checkpoint files.
     for examples in splits.values():
         for example in examples:

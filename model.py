@@ -137,9 +137,9 @@ class DecisionJEPA:
             offset += count
         batch = {
             "contexts": contexts, "targets": jnp.stack(groups),
-            "mask": jnp.arange(width)[None, :] < jnp.asarray(counts)[:, None],
-            "labels": jnp.asarray([example.label for example in examples]),
-            "ordered": jnp.asarray([example.question.type == "score" for example in examples]),
+            "mask": np.arange(width)[None, :] < np.asarray(counts)[:, None],
+            "labels": np.asarray([example.label for example in examples], dtype=np.int32),
+            "ordered": np.asarray([example.question.type == "score" for example in examples]),
         }
         return jax.device_put(batch, self.device), tokens
 
