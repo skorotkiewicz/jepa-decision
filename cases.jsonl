@@ -1,0 +1,30 @@
+{"state":"Help! My payouts have been failing for 3 days.","type":"noul","instructions":"Does this message convey urgency?","criteria":{"true":"Explicitly time-sensitive","false":"No urgency expressed"},"expected":true}
+{"state":"Help! My payouts have been failing for 3 days.","type":"choice","instructions":"Which team should handle this?","criteria":{"billing":"Payments, invoicing, refunds","technical":"Bugs, outages, integrations","sales":"Pricing, upgrades, new accounts"},"expected":"billing"}
+{"state":"Help! My payouts have been failing for 3 days.","type":"score","instructions":"How frustrated is the customer?","criteria":["Calm","Frustrated","Very angry"],"expected":1}
+{"state":"Please refund my order","type":"noul","instructions":"Does the customer request a refund?","expected":true}
+{"state":"Do not refund the order. I want to keep it.","type":"noul","instructions":"Does the customer request a refund?","expected":false}
+{"state":"The red ball is inside the blue box.","type":"choice","instructions":"What color is the ball?","criteria":{"x":"Blue","y":"Red","z":"Green"},"expected":"y"}
+{"state":"The red ball is inside the blue box.","type":"choice","instructions":"What color is the box?","criteria":{"x":"Blue","y":"Red","z":"Green"},"expected":"x"}
+{"state":"Maya has a cat. Leo has a dog.","type":"choice","instructions":"Who owns the dog?","criteria":{"first":"Maya","second":"Leo","third":"Nobody"},"expected":"second"}
+{"state":"Maya has a cat. Leo has a dog.","type":"choice","instructions":"Who owns the cat?","criteria":{"first":"Maya","second":"Leo","third":"Nobody"},"expected":"first"}
+{"state":"The restaurant serves only vegan food. The soup contains no meat or dairy.","type":"noul","instructions":"Does the soup contain meat?","expected":false}
+{"state":"The train departs at 9 am, and arrives at noon.","type":"choice","instructions":"When does the train arrive?","criteria":{"early":"9 am","late":"Noon","night":"Midnight"},"expected":"late"}
+{"state":"The library is closed on Sundays and open on Mondays.","type":"noul","instructions":"Is the library open on Sundays?","expected":false}
+{"state":"The library is closed on Sundays and open on Mondays.","type":"noul","instructions":"Is the library open on Mondays?","expected":true}
+{"state":"I loved this movie. It was wonderful and I would watch it again.","type":"score","instructions":"How positive is this review?","criteria":["Negative","Neutral","Positive"],"expected":2}
+{"state":"This movie was awful. I hated every minute.","type":"score","instructions":"How positive is this review?","criteria":["Negative","Neutral","Positive"],"expected":0}
+{"state":"The machine is running normally, with no errors.","type":"choice","instructions":"What is the machine's status?","criteria":{"a":"Broken","b":"Running normally","c":"Turned off"},"expected":"b"}
+{"state":"I need help with a password reset. I cannot log in.","type":"choice","instructions":"Which team should help?","criteria":{"one":"Marketing campaigns","two":"Technical account access support","three":"Shipping and deliveries","four":"Hiring and recruitment"},"expected":"two"}
+{"state":"The package has arrived. The customer signed for it this morning.","type":"noul","instructions":"Has the package been delivered?","expected":true}
+{"state":"The package is still in the warehouse and has not shipped.","type":"noul","instructions":"Has the package been delivered?","expected":false}
+{"state":"Zoë lives in Paris, not Berlin. Her dog is called Café.","type":"choice","instructions":"Where does Zoë live?","criteria":{"a":"Berlin","b":"Rome","c":"Paris","d":"Madrid"},"expected":"c"}
+{"state":"The report is due tomorrow at 8 am. We must finish tonight.","type":"score","instructions":"How time-sensitive is the task?","criteria":["No deadline","A distant deadline","An imminent deadline"],"expected":2}
+{"state":"All tickets have been sold. No seats remain.","type":"noul","instructions":"Are tickets still available?","expected":false}
+{"state":"The meeting has been moved from Tuesday to Friday.","type":"choice","instructions":"On what day will the meeting take place?","criteria":{"A":"Monday","B":"Tuesday","C":"Friday","D":"Sunday"},"expected":"C"}
+{"state":"I am furious. Your service is terrible and I will never use it again!","type":"score","instructions":"How angry is the speaker?","criteria":["Calm","Mildly annoyed","Extremely angry"],"expected":2}
+{"state":"The order contains three books and one notebook.","type":"choice","instructions":"How many books are in the order?","criteria":{"a":"One","b":"Two","c":"Three","d":"Four"},"expected":"c"}
+{"state":{"weather":"rainy","temperature":"cold"},"type":"choice","instructions":"What is the weather like?","criteria":{"sun":"Sunny","rain":"Rainy","snow":"Snowy"},"expected":"rain"}
+{"state":"Alex agreed to attend the meeting. Sam declined the invitation.","type":"noul","instructions":"Did Sam accept the invitation?","expected":false}
+{"state":"Alex agreed to attend the meeting. Sam declined the invitation.","type":"noul","instructions":"Did Alex accept the invitation?","expected":true}
+{"state":"This product is excellent. Five stars!","type":"score","instructions":"What rating fits this review?","criteria":["Very bad","Bad","Average","Good","Excellent"],"expected":4}
+{"state":"The document is written in French, not English.","type":"choice","instructions":"What language is the document written in?","criteria":{"one":"English","two":"French","three":"German"},"expected":"two"}
