@@ -6,7 +6,8 @@ from threading import Lock
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
-import torch
+import jax
+import numpy as np
 
 from model import DecisionJEPA, Example
 from schema import DecisionRequest, state_text
@@ -32,13 +33,13 @@ def decisions(payload: DecisionRequest, request: Request):
         raise HTTPException(404, "unknown model")
     examples = [Example(state_text(payload.state), question) for question in payload.questions.values()]
     # ponytail: serial inference, use a batch queue if measured throughput requires it.
-    with request.app.state.lock, torch.inference_mode():
+    with request.app.state.lock:
         try:
             logits, _, _, input_tokens = model(examples)
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
         answers = {
-            name: question.answer((scores / model.temperature).softmax(-1).cpu().tolist())
+            name: question.answer(np.asarray(jax.nn.softmax(scores / model.temperature)).tolist())
             for (name, question), scores in zip(payload.questions.items(), logits)
         }
     return {

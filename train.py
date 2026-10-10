@@ -6,7 +6,10 @@ from pathlib import Path
 import random
 import uuid
 
-import torch
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
 
 from model import DecisionJEPA, Example, collect_logits, fit_temperature, metrics
 from schema import TrainingRecord, state_text
@@ -63,7 +66,7 @@ def main():
     for split in ("train", "validation", "calibration", "test"):
         parser.add_argument(f"--{split}", required=True, help="Labeled JSONL, disjoint states and groups")
     parser.add_argument("--output", required=True, help="New checkpoint directory")
-    parser.add_argument("--encoder", default="sentence-transformers/all-mpnet-base-v2")
+    parser.add_argument("--encoder", default="sentence-transformers/all-MiniLM-L6-v2")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -76,43 +79,56 @@ def main():
         parser.error("output already exists; choose a new directory")
     splits = load_splits({name: getattr(args, name) for name in ("train", "validation", "calibration", "test")})
     random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    model = DecisionJEPA(args.encoder, args.device)
-    # Validate every sequence before producing any checkpoint files.
+    rng = jax.random.PRNGKey(args.seed)
+    model = DecisionJEPA(args.encoder, args.device, seed=args.seed)
+    # Check lengths without evaluating test labels or creating checkpoint files.
     for examples in splits.values():
-        collect_logits(model, examples, args.batch_size)
+        for example in examples:
+            model.tokenize([example.context(), *example.targets()])
     output.mkdir(parents=True)
-    model.target_encoder.save_pretrained(str(output / "target"))
-    optimizer = torch.optim.AdamW([
-        {"params": model.context_encoder.parameters(), "lr": 2e-5},
-        {"params": model.predictor.parameters(), "lr": 1e-3},
-    ], weight_decay=0.01)
+    model.save_encoder(output)
     total_steps = args.epochs * ((len(splits["train"]) + args.batch_size - 1) // args.batch_size)
     warmup_steps = max(1, int(total_steps * 0.1))
 
     def learning_rate(step):
-        if step < warmup_steps:
-            return (step + 1) / warmup_steps
-        return max(0.0, (total_steps - step) / max(1, total_steps - warmup_steps))
+        return jnp.where(
+            step < warmup_steps, (step + 1) / warmup_steps,
+            jnp.maximum(0.0, (total_steps - step) / max(1, total_steps - warmup_steps)),
+        )
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate)
+    parameter_groups = {
+        "context": jax.tree.map(lambda _: "context", model.params["context"]),
+        "predictor": jax.tree.map(lambda _: "predictor", model.params["predictor"]),
+    }
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.multi_transform({
+            "context": optax.adamw(lambda step: 2e-5 * learning_rate(step), weight_decay=0.01),
+            "predictor": optax.adamw(lambda step: 1e-3 * learning_rate(step), weight_decay=0.01),
+        }, parameter_groups),
+    )
+    optimizer_state = optimizer.init(model.params)
+
+    @jax.jit
+    def train_step(params, optimizer_state, batch, rng):
+        loss, gradients = jax.value_and_grad(model.loss)(params, batch, rng)
+        updates, optimizer_state = optimizer.update(gradients, optimizer_state, params)
+        return optax.apply_updates(params, updates), optimizer_state, loss, optax.global_norm(gradients)
+
     best_nll, stale, best_epoch = float("inf"), 0, 0
     for epoch in range(1, args.epochs + 1):
-        model.train()
         examples = list(splits["train"])
         random.shuffle(examples)
         epoch_loss = 0.0
         for start in range(0, len(examples), args.batch_size):
-            batch = examples[start:start + args.batch_size]
-            optimizer.zero_grad(set_to_none=True)
-            loss = model.loss(batch)
-            if not torch.isfinite(loss):
-                raise ValueError("non-finite loss; no usable checkpoint was finalized")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
-            optimizer.step()
-            scheduler.step()
-            epoch_loss += float(loss.detach()) * len(batch)
+            examples_batch = examples[start:start + args.batch_size]
+            batch, _ = model.prepare(examples_batch)
+            rng, dropout_rng = jax.random.split(rng)
+            params, next_state, loss, gradient_norm = train_step(model.params, optimizer_state, batch, dropout_rng)
+            if not np.isfinite(float(loss)) or not np.isfinite(float(gradient_norm)):
+                raise ValueError("non-finite loss or gradient; no usable checkpoint was finalized")
+            model.params, optimizer_state = params, next_state
+            epoch_loss += float(loss) * len(examples_batch)
         validation_logits = collect_logits(model, splits["validation"], args.batch_size)
         validation = report(validation_logits, splits["validation"])
         print(json.dumps({"epoch": epoch, "loss": epoch_loss / len(examples), "validation": validation}), flush=True)
@@ -138,7 +154,7 @@ def main():
         "pretrained_baseline_test": report(baseline_test, splits["test"], baseline_temperature),
     }
     metadata = {
-        "format": 1, "model_id": model.model_id, "encoder": args.encoder,
+        "format": 2, "backend": "jax", "model_id": model.model_id, "encoder": args.encoder,
         "temperature": model.temperature, "baseline_temperature": baseline_temperature,
         "best_epoch": best_epoch, "seed": args.seed,
         "split_counts": {name: len(examples) for name, examples in splits.items()},

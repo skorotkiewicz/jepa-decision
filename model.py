@@ -1,15 +1,16 @@
-"""Supervised text JEPA: predict a frozen semantic target, then rank candidates."""
+"""Supervised text JEPA with JAX, a frozen semantic teacher, and candidate ranking."""
 
-from copy import deepcopy
 from dataclasses import dataclass
 import json
 from pathlib import Path
 
-import torch
-from torch import nn
-from torch.nn import functional as F
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import batch_to_device
+from flax import linen as nn, serialization
+from huggingface_hub import file_exists, snapshot_download
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from transformers import AutoTokenizer, FlaxAutoModel
 
 from schema import Question
 
@@ -28,130 +29,206 @@ class Example:
         return [f"Question: {self.question.instructions}\nDecision: {text}" for text in descriptions]
 
 
-class DecisionJEPA(nn.Module):
-    def __init__(self, encoder: str, device: str = "cpu", target: str | None = None):
-        super().__init__()
-        self.context_encoder = SentenceTransformer(encoder, device=device, trust_remote_code=False)
-        # A frozen pretrained teacher keeps the semantic targets stationary.
-        # This is supervised latent prediction, not self-supervised I-JEPA.
-        self.target_encoder = (
-            SentenceTransformer(target, device=device, trust_remote_code=False)
-            if target else deepcopy(self.context_encoder)
-        )
-        self.target_encoder.requires_grad_(False)
-        dimension = self.context_encoder.get_sentence_embedding_dimension()
-        self.predictor = nn.Sequential(
-            nn.LayerNorm(dimension), nn.Linear(dimension, dimension),
-            nn.GELU(), nn.Linear(dimension, dimension),
-        ).to(device)
-        nn.init.zeros_(self.predictor[-1].weight)
-        nn.init.zeros_(self.predictor[-1].bias)
+def normalize(values):
+    return values / jnp.maximum(jnp.linalg.norm(values, axis=-1, keepdims=True), 1e-12)
+
+
+class Predictor(nn.Module):
+    dimension: int
+
+    @nn.compact
+    def __call__(self, context):
+        hidden = nn.LayerNorm()(context)
+        hidden = nn.gelu(nn.Dense(self.dimension)(hidden))
+        residual = nn.Dense(self.dimension, kernel_init=nn.initializers.zeros)(hidden)
+        return normalize(context + residual)
+
+
+def encoder_path(encoder: str) -> Path:
+    path = Path(encoder)
+    if not path.is_dir():
+        # Download only native Flax or safetensors, never a pickle/.bin checkpoint.
+        weights = "flax_model.msgpack" if file_exists(encoder, "flax_model.msgpack") else "model.safetensors"
+        path = Path(snapshot_download(encoder, allow_patterns=[
+            weights, "*.json", "vocab.txt", "merges.txt", "tokenizer.model", "spiece.model",
+        ]))
+    if not any((path / name).is_file() for name in ("flax_model.msgpack", "model.safetensors")):
+        raise ValueError("encoder needs native Flax or unsharded safetensors weights, not PyTorch .bin")
+    modules_file = path / "modules.json"
+    if modules_file.exists():
+        supported = {
+            "sentence_transformers.models.Transformer", "sentence_transformers.models.Pooling",
+            "sentence_transformers.models.Normalize",
+        }
+        if any(module["type"] not in supported for module in json.loads(modules_file.read_text())):
+            raise ValueError("encoder has unsupported SentenceTransformer modules")
+    pooling_file = path / "1_Pooling" / "config.json"
+    if pooling_file.exists():
+        pooling = json.loads(pooling_file.read_text())
+        if not pooling.get("pooling_mode_mean_tokens") or any(
+            value for key, value in pooling.items()
+            if key.startswith("pooling_mode_") and key != "pooling_mode_mean_tokens"
+        ):
+            raise ValueError("encoder must use mean-token pooling")
+    return path
+
+
+class DecisionJEPA:
+    def __init__(self, encoder: str, device: str = "cpu", seed: int = 42):
+        platform, _, index = device.partition(":")
+        self.device = jax.devices(platform)[int(index or 0)]
+        path = encoder_path(encoder)
+        self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=False)
+        with jax.default_device(self.device):
+            self.encoder = FlaxAutoModel.from_pretrained(
+                path, from_pt=not (path / "flax_model.msgpack").exists(),
+                dtype=jnp.float32, trust_remote_code=False,
+            )
+            # Immutable pretrained parameters are the teacher, excluded from optimization.
+            # This is supervised latent prediction, not self-supervised I-JEPA.
+            self.target_params = jax.device_put(self.encoder.params, self.device)
+            dimension = self.encoder.config.hidden_size
+            self.predictor = Predictor(dimension)
+            self.params = {
+                "context": self.target_params,
+                "predictor": self.predictor.init(jax.random.PRNGKey(seed), jnp.zeros((1, dimension)))["params"],
+            }
+        limit_file = path / "sentence_bert_config.json"
+        limit = json.loads(limit_file.read_text())["max_seq_length"] if limit_file.exists() else 256
+        self.max_seq_length = min(limit, self.encoder.config.max_position_embeddings)
         self.temperature = 1.0
         self.model_id = "jepa-decision"
-        self.train(False)
+        self._embed = jax.jit(self.encode)
+        self._infer = jax.jit(self.predict)
 
-    def train(self, mode: bool = True):
-        super().train(mode)
-        self.target_encoder.eval()
-        return self
-
-    def embed(self, encoder, texts: list[str]) -> tuple[torch.Tensor, int]:
+    def tokenize(self, texts: list[str]):
         # Never silently discard the end of a state, including a negation.
-        tokenized = encoder.tokenizer(texts, truncation=False, padding=False)
-        lengths = [len(ids) for ids in tokenized["input_ids"]]
-        if max(lengths) > encoder.max_seq_length:
-            raise ValueError(f"input exceeds encoder limit of {encoder.max_seq_length} tokens")
-        embeddings = []
-        for start in range(0, len(texts), 32):
-            features = batch_to_device(encoder.tokenize(texts[start:start + 32]), encoder.device)
-            embeddings.append(encoder(features)["sentence_embedding"])
-        return F.normalize(torch.cat(embeddings), dim=-1), sum(lengths)
+        raw = self.tokenizer(texts, truncation=False, padding=False)
+        lengths = [len(ids) for ids in raw["input_ids"]]
+        if max(lengths) > self.max_seq_length:
+            raise ValueError(f"input exceeds encoder limit of {self.max_seq_length} tokens")
+        features = self.tokenizer.pad(raw, padding="max_length", max_length=self.max_seq_length, return_tensors="np")
+        return jax.device_put(dict(features), self.device), sum(lengths)
 
-    def forward(self, examples: list[Example], baseline: bool = False):
-        context_encoder = self.target_encoder if baseline else self.context_encoder
-        context, tokens = self.embed(context_encoder, [example.context() for example in examples])
-        predicted = context if baseline else F.normalize(context + self.predictor(context), dim=-1)
+    def encode(self, params, tokens, dropout_rng=None):
+        hidden = self.encoder(
+            **tokens, params=params, train=dropout_rng is not None, dropout_rng=dropout_rng,
+        ).last_hidden_state
+        mask = tokens["attention_mask"][..., None]
+        pooled = (hidden * mask).sum(axis=1) / jnp.maximum(mask.sum(axis=1), 1)
+        return normalize(pooled)
+
+    def prepare(self, examples: list[Example]):
+        if not examples:
+            raise ValueError("batch cannot be empty")
+        contexts, tokens = self.tokenize([example.context() for example in examples])
         target_texts = [text for example in examples for text in example.targets()]
-        with torch.no_grad():
-            targets, target_tokens = self.embed(self.target_encoder, target_texts)
-        logits, groups = [], []
-        offset = 0
-        for index, example in enumerate(examples):
-            count = len(example.question.options()[0])
-            group = targets[offset:offset + count]
-            groups.append(group)
-            logits.append(20.0 * (group @ predicted[index]))
+        embeddings = []
+        for start in range(0, len(target_texts), 32):
+            features, count = self.tokenize(target_texts[start:start + 32])
+            embeddings.append(self._embed(self.target_params, features))
+            tokens += count
+        targets = jax.lax.stop_gradient(jnp.concatenate(embeddings))
+        counts = [len(example.question.options()[0]) for example in examples]
+        width = max(counts)
+        groups, offset = [], 0
+        for count in counts:
+            groups.append(jnp.pad(targets[offset:offset + count], ((0, width - count), (0, 0))))
             offset += count
-        return logits, predicted, groups, tokens + target_tokens
+        batch = {
+            "contexts": contexts, "targets": jnp.stack(groups),
+            "mask": jnp.arange(width)[None, :] < jnp.asarray(counts)[:, None],
+            "labels": jnp.asarray([example.label for example in examples]),
+            "ordered": jnp.asarray([example.question.type == "score" for example in examples]),
+        }
+        return jax.device_put(batch, self.device), tokens
 
-    def loss(self, examples: list[Example]) -> torch.Tensor:
-        logits, predictions, targets, _ = self(examples)
-        losses = []
-        for example, scores, prediction, group in zip(examples, logits, predictions, targets):
-            label = torch.tensor([example.label], device=scores.device)
-            ranking = F.cross_entropy(scores[None], label)
-            latent = 1.0 - (prediction * group[example.label]).sum()
-            loss = ranking + 0.5 * latent
-            if example.question.type == "score":
-                # Ordered bins: penalize probability mass crossing each ordinal boundary.
-                cdf = scores.softmax(-1).cumsum(-1)[:-1]
-                desired = (torch.arange(len(cdf), device=scores.device) >= example.label).float()
-                loss = loss + 0.2 * F.mse_loss(cdf, desired)
-            losses.append(loss)
-        return torch.stack(losses).mean()
+    def predict(self, params, batch, dropout_rng=None):
+        context = self.encode(params["context"], batch["contexts"], dropout_rng)
+        predicted = self.predictor.apply({"params": params["predictor"]}, context)
+        scores = 20.0 * jnp.einsum("bkd,bd->bk", batch["targets"], predicted)
+        return jnp.where(batch["mask"], scores, -jnp.inf), predicted
+
+    def __call__(self, examples: list[Example], baseline: bool = False):
+        batch, tokens = self.prepare(examples)
+        if baseline:
+            predicted = self._embed(self.target_params, batch["contexts"])
+            scores = 20.0 * jnp.einsum("bkd,bd->bk", batch["targets"], predicted)
+        else:
+            scores, predicted = self._infer(self.params, batch)
+        counts = [len(example.question.options()[0]) for example in examples]
+        return (
+            [scores[i, :count] for i, count in enumerate(counts)], predicted,
+            [batch["targets"][i, :count] for i, count in enumerate(counts)], tokens,
+        )
+
+    def loss(self, params, batch, dropout_rng=None):
+        scores, predicted = self.predict(params, batch, dropout_rng)
+        ranking = optax.softmax_cross_entropy_with_integer_labels(scores, batch["labels"])
+        correct_targets = batch["targets"][jnp.arange(len(predicted)), batch["labels"]]
+        latent = 1.0 - (predicted * correct_targets).sum(axis=-1)
+        # Ordered bins: penalize mass crossing each ordinal boundary, ignoring padding.
+        positions = jnp.arange(scores.shape[-1])[None, :]
+        boundaries = positions < (batch["mask"].sum(axis=-1, keepdims=True) - 1)
+        desired = positions >= batch["labels"][:, None]
+        error = (jax.nn.softmax(scores).cumsum(axis=-1) - desired) ** 2
+        ordinal = (error * boundaries).sum(axis=-1) / jnp.maximum(boundaries.sum(axis=-1), 1)
+        return (ranking + 0.5 * latent + 0.2 * ordinal * batch["ordered"]).mean()
+
+    def save_encoder(self, directory: Path):
+        path = directory / "encoder"
+        self.encoder.save_pretrained(path, params=self.target_params)
+        self.tokenizer.save_pretrained(path)
+        (path / "sentence_bert_config.json").write_text(json.dumps({"max_seq_length": self.max_seq_length}))
 
     def save_weights(self, directory: Path):
-        self.context_encoder.save_pretrained(str(directory / "context"))
-        torch.save(self.predictor.state_dict(), directory / "predictor.pt")
+        (directory / "parameters.msgpack").write_bytes(serialization.to_bytes(self.params))
 
     def restore_weights(self, directory: Path):
-        device = str(self.context_encoder.device)
-        self.context_encoder = SentenceTransformer(str(directory / "context"), device=device, trust_remote_code=False)
-        self.predictor.load_state_dict(torch.load(directory / "predictor.pt", map_location=device, weights_only=True))
-        self.train(False)
+        self.params = jax.device_put(
+            serialization.from_bytes(self.params, (directory / "parameters.msgpack").read_bytes()), self.device,
+        )
 
     @classmethod
     def load(cls, directory: str, device: str = "cpu"):
         path = Path(directory)
         metadata = json.loads((path / "metadata.json").read_text())
-        if metadata.get("format") != 1:
-            raise ValueError("unsupported checkpoint format")
-        model = cls(str(path / "context"), device, target=str(path / "target"))
-        model.predictor.load_state_dict(torch.load(path / "predictor.pt", map_location=device, weights_only=True))
+        if metadata.get("format") != 2 or metadata.get("backend") != "jax":
+            raise ValueError("checkpoint is not JAX format 2; retrain old PyTorch checkpoints")
+        model = cls(str(path / "encoder"), device)
+        model.restore_weights(path)
         model.temperature = float(metadata["temperature"])
         if not 0.05 <= model.temperature <= 20.0:
             raise ValueError("invalid checkpoint temperature")
         model.model_id = metadata["model_id"]
-        return model.eval()
+        return model
 
 
-@torch.inference_mode()
 def collect_logits(model: DecisionJEPA, examples: list[Example], batch_size: int, baseline: bool = False):
-    model.eval()
     collected = []
     for start in range(0, len(examples), batch_size):
         logits, _, _, _ = model(examples[start:start + batch_size], baseline=baseline)
-        collected.extend(scores.cpu() for scores in logits)
+        collected.extend(np.asarray(scores) for scores in logits)
     return collected
 
 
-def fit_temperature(logits: list[torch.Tensor], examples: list[Example]) -> float:
+def fit_temperature(logits: list, examples: list[Example]) -> float:
     # ponytail: one global temperature, per-type calibration when held-out NLL warrants it.
-    # A bounded grid includes 1.0, so calibration cannot worsen its own set's NLL.
-    temperatures = torch.cat([torch.logspace(-1.30103, 1.30103, 161), torch.ones(1)])
-    losses = torch.zeros(len(temperatures))
+    # Include 1.0 so calibration cannot worsen its own set's NLL.
+    temperatures = jnp.concatenate([jnp.geomspace(0.05, 20.0, 161), jnp.ones(1)])
+    losses = jnp.zeros(len(temperatures))
     for scores, example in zip(logits, examples):
-        scaled = scores[None] / temperatures[:, None]
-        losses += -scaled.log_softmax(-1)[:, example.label]
-    return float(temperatures[losses.argmin()].clamp(0.05, 20.0))
+        scaled = jnp.asarray(scores)[None] / temperatures[:, None]
+        losses -= jax.nn.log_softmax(scaled)[:, example.label]
+    return float(jnp.clip(temperatures[losses.argmin()], 0.05, 20.0))
 
 
-def metrics(logits: list[torch.Tensor], examples: list[Example], temperature: float = 1.0) -> dict:
-    probabilities = [(scores / temperature).softmax(-1) for scores in logits]
+def metrics(logits: list, examples: list[Example], temperature: float = 1.0) -> dict:
+    probabilities = [np.asarray(jax.nn.softmax(jnp.asarray(scores) / temperature)) for scores in logits]
     correct = [int(int(p.argmax()) == e.label) for p, e in zip(probabilities, examples)]
     confidence = [float(p.max()) for p in probabilities]
-    nll = [-float((scores / temperature).log_softmax(-1)[e.label]) for scores, e in zip(logits, examples)]
-    brier = [float((p - F.one_hot(torch.tensor(e.label), len(p))).square().sum()) for p, e in zip(probabilities, examples)]
+    nll = [-float(jax.nn.log_softmax(jnp.asarray(scores) / temperature)[e.label]) for scores, e in zip(logits, examples)]
+    brier = [float(((p - np.eye(len(p))[e.label]) ** 2).sum()) for p, e in zip(probabilities, examples)]
     ece = 0.0
     for index in range(15):
         members = [i for i, c in enumerate(confidence) if int(min(c * 15, 14)) == index]
@@ -162,7 +239,7 @@ def metrics(logits: list[torch.Tensor], examples: list[Example], temperature: fl
         "nll": sum(nll) / len(examples), "brier": sum(brier) / len(examples), "ece": ece,
     }
     score_errors = [
-        abs(float(p @ torch.arange(len(p), dtype=p.dtype)) - e.label)
+        abs(float(p @ np.arange(len(p))) - e.label)
         for p, e in zip(probabilities, examples) if e.question.type == "score"
     ]
     if score_errors:
