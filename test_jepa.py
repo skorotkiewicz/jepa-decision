@@ -1,16 +1,18 @@
 """Offline backend checks. Tiny random weights test mechanics, not accuracy."""
 
-from contextlib import redirect_stdout
-import io
 import json
 import os
 from pathlib import Path
+import socket
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+import httpx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -20,7 +22,7 @@ from transformers import BertConfig, BertTokenizerFast, FlaxBertModel
 from api import app
 from model import DecisionJEPA, Example, fit_temperature, metrics
 from schema import Question
-from train import load_splits, main
+from train import load_splits
 
 
 class JepaTest(unittest.TestCase):
@@ -153,17 +155,53 @@ class JepaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "leakage"):
             load_splits({"train": paths["train"], "validation": paths["train"]})
         output = self.root / "trained"
-        argv = ["train.py", "--encoder", str(self.encoder), "--output", str(output), "--epochs", "1", "--batch-size", "3"]
+        repo = Path(__file__).resolve().parent
+        env = {**os.environ, "PYTHON": sys.executable, "JAX_PLATFORMS": "cpu", "JEPA_CHECKPOINT": str(output)}
+        argv = [str(repo / "train.sh"), "--encoder", str(self.encoder), "--output", str(output), "--epochs", "1", "--batch-size", "3"]
         for split, path in paths.items():
             argv += [f"--{split}", path]
-        with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()):
-            main()
+        trained = subprocess.run(argv, cwd=self.root, env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(trained.returncode, 0, trained.stdout + trained.stderr)
         metadata = json.loads((output / "metadata.json").read_text())
         self.assertEqual(metadata["backend"], "jax")
         self.assertEqual(metadata["best_epoch"], 1)
         self.assertEqual(metadata["metrics"]["test"]["count"], 3)
         self.assertEqual(set(metadata["metrics"]["test"]["by_type"]), {"noul", "choice", "score"})
         self.assertEqual(len(DecisionJEPA.load(str(output))(self.examples)[0]), 3)
+
+        log_path = self.root / "server.log"
+        with socket.socket() as listener, log_path.open("w") as log:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            server = subprocess.Popen(
+                [str(repo / "run.sh"), "--fd", str(listener.fileno())],
+                cwd=self.root, env=env, pass_fds=(listener.fileno(),), stdout=log, stderr=log,
+            )
+            try:
+                with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=1, trust_env=False) as client:
+                    deadline = time.monotonic() + 60
+                    while True:
+                        try:
+                            if client.get("/openapi.json").status_code == 200:
+                                break
+                        except httpx.TransportError:
+                            pass
+                        if server.poll() is not None or time.monotonic() >= deadline:
+                            self.fail(f"server did not start: {log_path.read_text()}")
+                        time.sleep(0.1)
+                    response = client.post("/v1/decisions", json={
+                        "model": "vlang-research", "state": "Please refund my order, Zoë.",
+                        "questions": {name: q.model_dump() for name, q in self.questions.items()},
+                    }, timeout=30)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    result = response.json()
+                    self.assertEqual(result["model"], metadata["model_id"])
+                    self.assertEqual(set(result["answers"]), set(self.questions))
+                    self.assertEqual(result["usage"]["output_tokens"], 0)
+            finally:
+                server.terminate()
+                server.wait(timeout=10)
 
 
 if __name__ == "__main__":

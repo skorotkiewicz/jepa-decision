@@ -28,13 +28,12 @@ Each JSONL row is an API request plus an `answers` object. Boolean answers are J
 Provide four nonempty, disjoint files. Repeated states or explicit `group` values across splits are rejected. Use groups for conversations, customers, or source documents so paraphrases do not leak. Include negation, Unicode, hard alternatives, unseen question templates, and representative option counts in the held-out data.
 
 ```sh
-.venv/bin/python train.py \
-  --train data/train.jsonl \
-  --validation data/validation.jsonl \
-  --calibration data/calibration.jsonl \
-  --test data/test.jsonl \
-  --output checkpoints/run-1
+./train.sh
 ```
+
+Defaults are `data/train.jsonl`, `data/validation.jsonl`, `data/calibration.jsonl`, `data/test.jsonl`, and output `checkpoints/run-1`. Create the labeled data files first. Pass any `train.py` options to override defaults, for example `./train.sh --epochs 1 --output checkpoints/run-2`. Existing checkpoint directories are not overwritten.
+
+Both scripts run from the repository directory, even when called elsewhere. They use `.venv/bin/python`; set `PYTHON=/path/to/python` to use another installed environment. They do not install dependencies automatically.
 
 The context encoder and predictor have separate AdamW learning rates with warmup, decay, and gradient clipping. JAX `jit` compiles the training step, and `value_and_grad` computes derivatives. Teacher parameters never enter the optimizer. Tokenization and frozen-target preparation happen outside that step. Variable batch sizes and option counts can trigger additional compilations.
 
@@ -45,7 +44,13 @@ CPU is the default. `--device gpu` or `--device gpu:0` requires a compatible acc
 ## Serving
 
 ```sh
-JEPA_CHECKPOINT=checkpoints/run-1 .venv/bin/uvicorn api:app --port 8001
+./run.sh
+```
+
+The server runs in the foreground at `http://127.0.0.1:8001`, loading `checkpoints/run-1`. Stop it with Ctrl+C. Override the checkpoint and Uvicorn options as needed:
+
+```sh
+JEPA_CHECKPOINT=checkpoints/run-2 ./run.sh --port 8002
 ```
 
 `POST /v1/decisions` keeps the `example.md` request and answer shapes, including the `vlang-research` model alias. The response identifies the actual local checkpoint. Confidence is the maximum calibrated option probability. A score is the expected zero-based bin index, not an argmax. Long inputs receive HTTP 422 rather than silent truncation.
@@ -61,7 +66,7 @@ uv pip install httpx
 .venv/bin/python -m unittest -v test_jepa
 ```
 
-Tests build a tiny local Flax BERT, with no model download. They check gradients, teacher immutability, loss reduction, variable options, option permutation, calibration, checkpoints, training, and HTTP responses.
+Tests build a tiny local Flax BERT, with no model download. They check gradients, teacher immutability, loss reduction, variable options, option permutation, calibration, and checkpoints. The integration check trains through `train.sh`, starts `run.sh` on a reserved local socket, sends a real HTTP request for all three question types, and stops the server.
 
 ## Research basis
 
